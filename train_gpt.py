@@ -547,39 +547,74 @@ def get_window_size_blocks(step: int):
 model: nn.Module = torch.compile(model, dynamic=False)
 
 ########################################
-#            Warmup kernels            #
+#     Warmup kernel and Layerwise Bucketing   #
 ########################################
 
-# Warmup the training kernels, then re-initialize the state so we aren't cheating
+# Track the gradient readiness order during warmup
+gradient_ready_order = []
+
+def record_grad_order_hook(param):
+    def hook(*_):
+        if param.grad is not None and all(param is not p for p in gradient_ready_order):
+            gradient_ready_order.append(param)
+    return hook
+
+# Register temp hooks to track when each parameter's gradient is ready
+tmp_handles = []
+for p in model.parameters():
+    if p.requires_grad:
+        handle = p.register_post_accumulate_grad_hook(record_grad_order_hook(p))
+        tmp_handles.append(handle)
+
 warmup_steps = 10
-initial_state = dict(model=copy.deepcopy(model.state_dict()),
-                     optimizers=[copy.deepcopy(opt.state_dict()) for opt in optimizers]) # save the initial state
-for _ in range(warmup_steps):
-    inputs = targets = torch.randint(0, args.vocab_size, size=(args.train_seq_len,), device="cuda")
+initial_state = dict(
+    model=copy.deepcopy(model.state_dict()),
+    optimizers=[copy.deepcopy(opt.state_dict()) for opt in optimizers]
+)
+
+for step in range(warmup_steps):
+    # Create a local generator with fixed, step-dependent seed
+    g = torch.Generator(device="cuda")
+    g.manual_seed(1337 + step)
+
+    inputs = targets = torch.randint(
+        low=0,
+        high=args.vocab_size,
+        size=(args.train_seq_len,),
+        device="cuda",
+        dtype=torch.long,
+        generator=g,  # <- Local generator ensures deterministic and isolated RNG
+    )
     model(inputs.to(torch.int32), targets, get_window_size_blocks(0)).backward()
     for opt in optimizers:
         opt.step()
     model.zero_grad(set_to_none=True)
+
+# Remove hooks after warmup
+for h in tmp_handles:
+    h.remove()
+
 model.load_state_dict(initial_state["model"])
 for opt, opt_state in zip(optimizers, initial_state["optimizers"]):
     opt.load_state_dict(opt_state)
 del initial_state
 
+print0(f"Collected {len(gradient_ready_order)} parameters in gradient-ready order")
+
 ########################################
 #      Overlap Communication Setup     #
 ########################################
 
-# Create parameter buckets for better overlap
-def create_buckets(params, bucket_size_mb=25):
-    """Group parameters into buckets of approximately bucket_size_mb MB each"""
+# Layer-aware bucketing using gradient-ready order
+def create_buckets_layerwise(ordered_params, bucket_size_mb=25):
+    """Group parameters into buckets of ~bucket_size_mb MB, in gradient ready order"""
     buckets = []
     current_bucket = []
     current_size = 0
 
-    # Sort parameters by size (largest first) for better bucketing
-    sorted_params = sorted(params, key=lambda p: p.numel(), reverse=True)
-
-    for param in sorted_params:
+    for param in ordered_params:
+        if not param.requires_grad:
+            continue
         param_size_mb = param.numel() * param.element_size() / (1024 * 1024)
 
         if current_size + param_size_mb > bucket_size_mb and current_bucket:
@@ -597,8 +632,7 @@ def create_buckets(params, bucket_size_mb=25):
 
 # Create buckets for all parameters
 all_params = [p for p in model.parameters() if p.requires_grad]
-param_buckets = create_buckets(all_params)
-
+param_buckets = create_buckets_layerwise(gradient_ready_order)
 print0(f"Created {len(param_buckets)} gradient buckets")
 for i, bucket in enumerate(param_buckets):
     total_size = sum(p.numel() * p.element_size() for p in bucket) / (1024 * 1024)
